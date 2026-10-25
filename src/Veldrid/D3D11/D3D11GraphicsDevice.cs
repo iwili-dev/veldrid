@@ -62,6 +62,8 @@ namespace Veldrid.D3D11
         private readonly ID3D11DeviceContext immediateContext;
         private readonly D3D11ResourceFactory d3d11ResourceFactory;
         private readonly D3D11Swapchain mainSwapchain;
+
+        internal D3D11Swapchain MainD3D11Swapchain => mainSwapchain;
         private readonly bool supportsConcurrentResources;
         private readonly bool supportsCommandLists;
         private readonly object immediateContextLock = new object();
@@ -500,6 +502,11 @@ namespace Veldrid.D3D11
             lock (immediateContextLock)
             {
                 var d3d11Sc = Util.AssertSubtype<Swapchain, D3D11Swapchain>(swapchain);
+
+                // exclusive fullscreen may have switched (and recreated) the swapchain: nothing has been rendered to the new one yet.
+                if (d3d11Sc.UpdateExclusiveFullscreen())
+                    return;
+
                 d3d11Sc.DxgiSwapChain.Present(d3d11Sc.SyncInterval, d3d11Sc.PresentFlags);
             }
         }

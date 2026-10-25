@@ -18,7 +18,7 @@ namespace Veldrid.D3D11
         {
             get
             {
-                if (AllowTearing && canTear && !SyncToVerticalBlank)
+                if (allowTearing && canTear && !classicExclusive && !SyncToVerticalBlank)
                     return PresentFlags.AllowTearing;
 
                 return PresentFlags.None;
@@ -26,6 +26,22 @@ namespace Veldrid.D3D11
         }
 
         public IDXGISwapChain DxgiSwapChain { get; private set; }
+
+        /// <summary>
+        /// Whether this swapchain was last successfully switched into DXGI exclusive fullscreen by <see cref="SetExclusiveFullscreen"/>.
+        /// </summary>
+        public bool IsExclusiveFullscreen { get; private set; }
+
+        /// <summary>
+        /// While true, the swapchain is (re)created in the classic bitblt model (SwapEffect.Discard + AllowModeSwitch),
+        /// which is the model DXGI exclusive fullscreen was designed for, instead of the flip model.
+        /// </summary>
+        private bool classicExclusive;
+
+        /// <summary>
+        /// Human-readable details about the last <see cref="SetExclusiveFullscreen"/> attempt (for logging).
+        /// </summary>
+        public string LastExclusiveInfo { get; private set; } = string.Empty;
 
         public int SyncInterval { get; private set; }
 
@@ -67,11 +83,29 @@ namespace Veldrid.D3D11
             }
         }
 
+        // Exclusive fullscreen is driven from here, so that an unmodified osu!framework works: it sets AllowTearing = (window mode == Fullscreen).
+        // On by default; set the environment variable OSU_D3D11_EXCLUSIVE=0 to disable.
+        private static readonly bool automaticExclusive = Environment.GetEnvironmentVariable("OSU_D3D11_EXCLUSIVE") != "0";
+        private const int max_automatic_failures = 3;
+        private bool exclusiveWanted;
+        private int automaticFailures;
+        private long lastExclusiveAttemptTicks;
+
         public bool AllowTearing
         {
-            get => allowTearing;
+            get => allowTearing || exclusiveWanted;
             set
             {
+                if (automaticExclusive && automaticFailures < max_automatic_failures && description.Source is Win32SwapchainSource)
+                {
+                    exclusiveWanted = value;
+
+                    if (!value && IsExclusiveFullscreen)
+                        SetExclusiveFullscreen(false, 0, 0, 0, 0);
+
+                    return;
+                }
+
                 if (allowTearing == value)
                     return;
 
@@ -204,6 +238,177 @@ namespace Veldrid.D3D11
             };
         }
 
+        /// <summary>
+        /// Switches the swapchain in or out of DXGI exclusive fullscreen.
+        /// For the duration of exclusive fullscreen the swapchain is recreated in the classic (bitblt) model, because DXGI
+        /// rejects <c>SetFullscreenState</c> on the flip-model swapchain used otherwise. Tearing is not used while exclusive
+        /// (exclusive fullscreen can present without vsync on its own).
+        /// </summary>
+        /// <returns>An HRESULT. Negative values are failures.</returns>
+        public int SetExclusiveFullscreen(bool fullscreen, int targetWidth, int targetHeight, int refreshNumerator, int refreshDenominator)
+        {
+            if (disposed || DxgiSwapChain == null)
+                return unchecked((int)0x80004005); // E_FAIL
+
+            if (fullscreen && (allowTearing || !classicExclusive))
+            {
+                allowTearing = false;
+                classicExclusive = true;
+                recreateSwapchain();
+            }
+
+            try
+            {
+                if (fullscreen)
+                {
+                    // null output = the output that contains the window. The display is already in the wanted mode (set through SDL).
+                    var result = DxgiSwapChain.SetFullscreenState(true, null);
+
+                    if (result.Failure)
+                    {
+                        // go back to the regular flip-model swapchain.
+                        classicExclusive = false;
+                        recreateSwapchain();
+
+                        LastExclusiveInfo = "SetFullscreenState(true) failed";
+                        return result.Code;
+                    }
+
+                    var mode = new ModeDescription(targetWidth, targetHeight, new Rational(refreshNumerator, refreshDenominator), colorFormat);
+                    result = DxgiSwapChain.ResizeTarget(mode);
+
+                    LastExclusiveInfo = result.Failure
+                        ? $"entered fullscreen (ResizeTarget failed with 0x{result.Code:X8}, ignored)"
+                        : "entered fullscreen";
+
+                    IsExclusiveFullscreen = true;
+                }
+                else
+                {
+                    IsExclusiveFullscreen = false;
+                    var result = DxgiSwapChain.SetFullscreenState(false, null);
+
+                    if (classicExclusive)
+                    {
+                        // go back to the regular flip-model swapchain.
+                        classicExclusive = false;
+                        recreateSwapchain();
+                    }
+
+                    if (result.Failure)
+                    {
+                        LastExclusiveInfo = "SetFullscreenState(false) failed";
+                        return result.Code;
+                    }
+
+                    LastExclusiveInfo = "left fullscreen";
+                }
+
+                return 0;
+            }
+            catch (Exception)
+            {
+                IsExclusiveFullscreen = false;
+                return unchecked((int)0x80004005);
+            }
+        }
+
+        /// <summary>
+        /// Called once per frame right before presenting. Enters exclusive fullscreen when it is wanted and the window is in the foreground,
+        /// and leaves it when it is not wanted or the window lost focus.
+        /// </summary>
+        /// <returns>Whether the swapchain was changed (in which case this frame should not be presented).</returns>
+        internal bool UpdateExclusiveFullscreen()
+        {
+            if (!exclusiveWanted && !IsExclusiveFullscreen)
+                return false;
+
+            if (disposed || !(description.Source is Win32SwapchainSource win32Source))
+                return false;
+
+            IntPtr hwnd = win32Source.Hwnd;
+            bool active = GetForegroundWindow() == hwnd && !IsIconic(hwnd);
+
+            if (exclusiveWanted && active)
+            {
+                if (IsExclusiveFullscreen)
+                    return false;
+
+                long now = Environment.TickCount64;
+                if (now - lastExclusiveAttemptTicks < 500)
+                    return false;
+
+                lastExclusiveAttemptTicks = now;
+
+                getRefreshRate(hwnd, out int numerator, out int denominator);
+
+                int hr = SetExclusiveFullscreen(true, (int)(width * pixelScale), (int)(height * pixelScale), numerator, denominator);
+
+                if (hr < 0 && ++automaticFailures >= max_automatic_failures)
+                {
+                    // give up and behave like before (tearing-enabled "optimised" fullscreen).
+                    exclusiveWanted = false;
+                    allowTearing = true;
+                    if (canTear) recreateSwapchain();
+                }
+
+                return true;
+            }
+
+            if (IsExclusiveFullscreen)
+            {
+                SetExclusiveFullscreen(false, 0, 0, 0, 0);
+                return true;
+            }
+
+            return false;
+        }
+
+        private static void getRefreshRate(IntPtr hwnd, out int numerator, out int denominator)
+        {
+            numerator = 0;
+            denominator = 0;
+
+            try
+            {
+                IntPtr monitor = MonitorFromWindow(hwnd, 2); // MONITOR_DEFAULTTONEAREST
+                var info = new MonitorInfoEx { cbSize = Marshal.SizeOf<MonitorInfoEx>() };
+                if (!GetMonitorInfoW(monitor, ref info)) return;
+
+                byte[] devMode = new byte[220]; // DEVMODEW
+                BitConverter.GetBytes((ushort)220).CopyTo(devMode, 68); // dmSize
+                if (!EnumDisplaySettingsW(info.szDevice, -1, devMode)) return; // ENUM_CURRENT_SETTINGS
+
+                int hz = BitConverter.ToInt32(devMode, 184); // dmDisplayFrequency
+                if (hz > 1)
+                {
+                    numerator = hz * 1000;
+                    denominator = 1000;
+                }
+            }
+            catch (Exception)
+            {
+            }
+        }
+
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        private struct MonitorInfoEx
+        {
+            public int cbSize;
+            public int left, top, right, bottom;
+            public int workLeft, workTop, workRight, workBottom;
+            public uint flags;
+
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)]
+            public string szDevice;
+        }
+
+        [DllImport("user32.dll")] private static extern IntPtr GetForegroundWindow();
+        [DllImport("user32.dll")] private static extern bool IsIconic(IntPtr hWnd);
+        [DllImport("user32.dll")] private static extern IntPtr MonitorFromWindow(IntPtr hwnd, uint flags);
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)] private static extern bool GetMonitorInfoW(IntPtr hMonitor, ref MonitorInfoEx lpmi);
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)] private static extern bool EnumDisplaySettingsW(string lpszDeviceName, int iModeNum, byte[] lpDevMode);
+
         public void WaitForNextFrameReady()
         {
             frameLatencyWaitHandle?.WaitOne(1000);
@@ -242,14 +447,20 @@ namespace Veldrid.D3D11
             using (var dxgiFactory4 = gd.Adapter.GetParent(out IDXGIFactory4 f).Success ? f : null)
                 canUseFlipDiscard = dxgiFactory4 != null;
 
+            if (classicExclusive)
+                canUseFlipDiscard = false;
+
             var swapEffect = canUseFlipDiscard ? SwapEffect.FlipDiscard : SwapEffect.Discard;
 
             flags = SwapChainFlags.None;
 
-            if (AllowTearing && canTear)
+            if (allowTearing && canTear && !classicExclusive)
                 flags |= SwapChainFlags.AllowTearing;
             else if (canCreateFrameLatencyWaitableObject && canUseFlipDiscard)
                 flags |= SwapChainFlags.FrameLatencyWaitableObject;
+
+            if (classicExclusive)
+                flags |= SwapChainFlags.AllowModeSwitch;
 
             if (description.Source is Win32SwapchainSource win32Source)
             {
