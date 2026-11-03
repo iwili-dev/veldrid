@@ -86,10 +86,26 @@ namespace Veldrid.D3D11
         // Exclusive fullscreen is driven from here, so that an unmodified osu!framework works: it sets AllowTearing = (window mode == Fullscreen).
         // On by default; set the environment variable OSU_D3D11_EXCLUSIVE=0 to disable.
         private static readonly bool automaticExclusive = Environment.GetEnvironmentVariable("OSU_D3D11_EXCLUSIVE") != "0";
+
+        // Experimental, off by default: stay in exclusive fullscreen while a window on ANOTHER monitor is active (OBS, chat, browser on a second screen),
+        // so clicking there does not make the game screen blink. Only used while "Minimise osu! when switching to another app" is off.
+        // Set the environment variable OSU_D3D11_KEEP_ON_OTHER_MONITOR=1 to enable.
+        private static readonly bool keepOnOtherMonitor = Environment.GetEnvironmentVariable("OSU_D3D11_KEEP_ON_OTHER_MONITOR") == "1";
+
+        // Give up after this many failed attempts in a row (a success resets the counter, so many Alt+Tabs over a session do not add up).
         private const int max_automatic_failures = 3;
+        private const int retry_delay_ms = 500;
+        private const int state_check_interval_ms = 100;
+
+        // DXGI_ERROR_NOT_CURRENTLY_AVAILABLE: usually temporary (another app or overlay holds the output), so it gets a longer budget.
+        private const int dxgi_error_not_currently_available = unchecked((int)0x887A0022);
+        private const int max_not_available_failures = 20;
+
         private bool exclusiveWanted;
         private int automaticFailures;
+        private int notAvailableFailures;
         private long lastExclusiveAttemptTicks;
+        private long lastStateCheckTicks;
 
         public bool AllowTearing
         {
@@ -100,7 +116,8 @@ namespace Veldrid.D3D11
                 {
                     exclusiveWanted = value;
 
-                    if (!value && IsExclusiveFullscreen)
+                    // leaving the Fullscreen window mode: leave exclusive and go back to the flip-model swapchain.
+                    if (!value && (IsExclusiveFullscreen || classicExclusive))
                         SetExclusiveFullscreen(false, 0, 0, 0, 0);
 
                     return;
@@ -176,6 +193,20 @@ namespace Veldrid.D3D11
         {
             if (!disposed)
             {
+                // DXGI does not allow releasing a swapchain that is still in fullscreen.
+                if (IsExclusiveFullscreen || isReallyFullscreen())
+                {
+                    try
+                    {
+                        DxgiSwapChain?.SetFullscreenState(false, null);
+                    }
+                    catch (Exception)
+                    {
+                    }
+
+                    IsExclusiveFullscreen = false;
+                }
+
                 depthTexture?.Dispose();
                 framebuffer.Dispose();
                 DxgiSwapChain.Dispose();
@@ -243,6 +274,7 @@ namespace Veldrid.D3D11
         /// For the duration of exclusive fullscreen the swapchain is recreated in the classic (bitblt) model, because DXGI
         /// rejects <c>SetFullscreenState</c> on the flip-model swapchain used otherwise. Tearing is not used while exclusive
         /// (exclusive fullscreen can present without vsync on its own).
+        /// Leaving through this method also goes back to the flip-model swapchain.
         /// </summary>
         /// <returns>An HRESULT. Negative values are failures.</returns>
         public int SetExclusiveFullscreen(bool fullscreen, int targetWidth, int targetHeight, int refreshNumerator, int refreshDenominator)
@@ -250,65 +282,90 @@ namespace Veldrid.D3D11
             if (disposed || DxgiSwapChain == null)
                 return unchecked((int)0x80004005); // E_FAIL
 
-            if (fullscreen && (allowTearing || !classicExclusive))
+            if (fullscreen)
+                return enterExclusive(targetWidth, targetHeight, refreshNumerator, refreshDenominator);
+
+            int hr = leaveExclusive();
+
+            if (classicExclusive)
             {
-                allowTearing = false;
-                classicExclusive = true;
+                // go back to the regular flip-model swapchain.
+                classicExclusive = false;
                 recreateSwapchain();
             }
 
+            return hr;
+        }
+
+        private int enterExclusive(int targetWidth, int targetHeight, int refreshNumerator, int refreshDenominator)
+        {
             try
             {
-                if (fullscreen)
+                // switch to the classic model once. While the window is only alt-tabbed out it stays in that model,
+                // so Alt+Tab does not recreate the swapchain (fast, and OBS game capture keeps its hook).
+                if (allowTearing || !classicExclusive)
                 {
-                    // null output = the output that contains the window. The display is already in the wanted mode (set through SDL).
-                    var result = DxgiSwapChain.SetFullscreenState(true, null);
-
-                    if (result.Failure)
-                    {
-                        // go back to the regular flip-model swapchain.
-                        classicExclusive = false;
-                        recreateSwapchain();
-
-                        LastExclusiveInfo = "SetFullscreenState(true) failed";
-                        return result.Code;
-                    }
-
-                    var mode = new ModeDescription(targetWidth, targetHeight, new Rational(refreshNumerator, refreshDenominator), colorFormat);
-                    result = DxgiSwapChain.ResizeTarget(mode);
-
-                    LastExclusiveInfo = result.Failure
-                        ? $"entered fullscreen (ResizeTarget failed with 0x{result.Code:X8}, ignored)"
-                        : "entered fullscreen";
-
-                    IsExclusiveFullscreen = true;
+                    allowTearing = false;
+                    classicExclusive = true;
+                    recreateSwapchain();
                 }
-                else
+
+                updateWindowAssociation();
+
+                // null output = the output that contains the window. The display is already in the wanted mode (set through SDL).
+                var result = DxgiSwapChain.SetFullscreenState(true, null);
+
+                if (result.Failure)
                 {
+                    // stay in the classic model, the next attempt only has to call SetFullscreenState again.
                     IsExclusiveFullscreen = false;
-                    var result = DxgiSwapChain.SetFullscreenState(false, null);
-
-                    if (classicExclusive)
-                    {
-                        // go back to the regular flip-model swapchain.
-                        classicExclusive = false;
-                        recreateSwapchain();
-                    }
-
-                    if (result.Failure)
-                    {
-                        LastExclusiveInfo = "SetFullscreenState(false) failed";
-                        return result.Code;
-                    }
-
-                    LastExclusiveInfo = "left fullscreen";
+                    LastExclusiveInfo = $"SetFullscreenState(true) failed with 0x{result.Code:X8}";
+                    return result.Code;
                 }
+
+                IsExclusiveFullscreen = true;
+
+                var mode = new ModeDescription(targetWidth, targetHeight, new Rational(refreshNumerator, refreshDenominator), colorFormat);
+                result = DxgiSwapChain.ResizeTarget(mode);
+
+                // DXGI expects ResizeBuffers after every fullscreen transition.
+                resizeAfterTransition();
+
+                LastExclusiveInfo = result.Failure
+                    ? $"entered fullscreen (ResizeTarget failed with 0x{result.Code:X8}, ignored)"
+                    : "entered fullscreen";
 
                 return 0;
             }
             catch (Exception)
             {
-                IsExclusiveFullscreen = false;
+                IsExclusiveFullscreen = isReallyFullscreen();
+                LastExclusiveInfo = "entering fullscreen threw an exception";
+                return unchecked((int)0x80004005);
+            }
+        }
+
+        /// <summary>
+        /// Leaves exclusive fullscreen but keeps the classic-model swapchain (used when the window loses focus).
+        /// </summary>
+        private int leaveExclusive()
+        {
+            if (!IsExclusiveFullscreen && !isReallyFullscreen())
+                return 0;
+
+            IsExclusiveFullscreen = false;
+
+            try
+            {
+                var result = DxgiSwapChain.SetFullscreenState(false, null);
+                resizeAfterTransition();
+
+                LastExclusiveInfo = result.Failure ? $"SetFullscreenState(false) failed with 0x{result.Code:X8}" : "left fullscreen";
+                return result.Failure ? result.Code : 0;
+            }
+            catch (Exception)
+            {
+                LastExclusiveInfo = "leaving fullscreen threw an exception";
                 return unchecked((int)0x80004005);
             }
         }
@@ -320,49 +377,190 @@ namespace Veldrid.D3D11
         /// <returns>Whether the swapchain was changed (in which case this frame should not be presented).</returns>
         internal bool UpdateExclusiveFullscreen()
         {
-            if (!exclusiveWanted && !IsExclusiveFullscreen)
+            if (!exclusiveWanted && !IsExclusiveFullscreen && !classicExclusive)
                 return false;
 
             if (disposed || !(description.Source is Win32SwapchainSource win32Source))
                 return false;
 
             IntPtr hwnd = win32Source.Hwnd;
-            bool active = GetForegroundWindow() == hwnd && !IsIconic(hwnd);
+            long now = Environment.TickCount64;
 
-            if (exclusiveWanted && active)
+            // Windows or DXGI can drop exclusive fullscreen without us (Alt+Tab while the game minimises and stops drawing,
+            // Ctrl+Alt+Del, UAC prompts, ...). Without this check the game believed it was still exclusive and never went back.
+            if (IsExclusiveFullscreen && now - lastStateCheckTicks >= state_check_interval_ms)
+            {
+                lastStateCheckTicks = now;
+
+                if (!isReallyFullscreen())
+                {
+                    IsExclusiveFullscreen = false;
+                    resizeAfterTransition();
+                    LastExclusiveInfo = "exclusive fullscreen was lost, will enter again when focused";
+                    return true;
+                }
+            }
+
+            if (!exclusiveWanted)
+            {
+                SetExclusiveFullscreen(false, 0, 0, 0, 0);
+                return true;
+            }
+
+            bool focused = GetForegroundWindow() == hwnd && !IsIconic(hwnd);
+
+            if (focused)
             {
                 if (IsExclusiveFullscreen)
                     return false;
 
-                long now = Environment.TickCount64;
-                if (now - lastExclusiveAttemptTicks < 500)
+                if (now - lastExclusiveAttemptTicks < retry_delay_ms)
                     return false;
 
                 lastExclusiveAttemptTicks = now;
 
                 getRefreshRate(hwnd, out int numerator, out int denominator);
 
-                int hr = SetExclusiveFullscreen(true, (int)(width * pixelScale), (int)(height * pixelScale), numerator, denominator);
+                var framebufferBefore = framebuffer;
+                int hr = enterExclusive((int)(width * pixelScale), (int)(height * pixelScale), numerator, denominator);
 
-                if (hr < 0 && ++automaticFailures >= max_automatic_failures)
+                bool giveUp = false;
+
+                if (hr >= 0)
+                {
+                    automaticFailures = 0;
+                    notAvailableFailures = 0;
+                }
+                else if (hr == dxgi_error_not_currently_available)
+                    giveUp = ++notAvailableFailures >= max_not_available_failures;
+                else
+                    giveUp = ++automaticFailures >= max_automatic_failures;
+
+                if (giveUp)
                 {
                     // give up and behave like before (tearing-enabled "optimised" fullscreen).
                     exclusiveWanted = false;
+                    classicExclusive = false;
                     allowTearing = true;
-                    if (canTear) recreateSwapchain();
+                    recreateSwapchain();
                 }
 
-                return true;
+                // a failed retry does not touch the swapchain, so that frame can still be shown.
+                return framebuffer != framebufferBefore;
             }
 
-            if (IsExclusiveFullscreen)
+            if (IsExclusiveFullscreen && !canStayExclusiveWhileUnfocused(hwnd))
             {
-                SetExclusiveFullscreen(false, 0, 0, 0, 0);
+                leaveExclusive();
                 return true;
             }
 
             return false;
         }
+
+        private bool isReallyFullscreen()
+        {
+            if (DxgiSwapChain == null)
+                return false;
+
+            try
+            {
+                var result = DxgiSwapChain.GetFullscreenState(out var fullscreen, out IDXGIOutput output);
+                output?.Dispose();
+                return result.Success && fullscreen;
+            }
+            catch (Exception)
+            {
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// Recreates the back buffers after a fullscreen transition. Falls back to recreating the swapchain if that fails.
+        /// </summary>
+        private void resizeAfterTransition()
+        {
+            try
+            {
+                Resize(width, height);
+            }
+            catch (Exception)
+            {
+                if (isReallyFullscreen())
+                {
+                    try
+                    {
+                        DxgiSwapChain.SetFullscreenState(false, null);
+                    }
+                    catch (Exception)
+                    {
+                    }
+                }
+
+                IsExclusiveFullscreen = false;
+                recreateSwapchain();
+            }
+        }
+
+        private void updateWindowAssociation()
+        {
+            if (!(description.Source is Win32SwapchainSource win32Source))
+                return;
+
+            // IgnoreAll (DXGI_MWA_NO_WINDOW_CHANGES) stops DXGI from leaving fullscreen by itself when the window loses focus.
+            // Only used in the experimental mode, and only when the game does not minimise (a minimised game stops drawing and could not leave by itself).
+            var flags = WindowAssociationFlags.IgnoreAltEnter;
+            if (keepOnOtherMonitor && !minimiseOnFocusLoss())
+                flags |= WindowAssociationFlags.IgnoreAll;
+
+            try
+            {
+                using (var dxgiFactory = gd.Adapter.GetParent<IDXGIFactory>())
+                    dxgiFactory.MakeWindowAssociation(win32Source.Hwnd, flags);
+            }
+            catch (Exception)
+            {
+            }
+        }
+
+        private static bool canStayExclusiveWhileUnfocused(IntPtr hwnd)
+        {
+            if (!keepOnOtherMonitor || IsIconic(hwnd) || minimiseOnFocusLoss())
+                return false;
+
+            IntPtr foreground = GetForegroundWindow();
+            if (foreground == IntPtr.Zero)
+                return false;
+
+            IntPtr gameMonitor = MonitorFromWindow(hwnd, 2); // MONITOR_DEFAULTTONEAREST
+            IntPtr otherMonitor = MonitorFromWindow(foreground, 0); // MONITOR_DEFAULTTONULL
+
+            return otherMonitor != IntPtr.Zero && otherMonitor != gameMonitor;
+        }
+
+        /// <summary>
+        /// Reads osu!'s "Minimise osu! when switching to another app" setting (osu!framework passes it to SDL as a hint).
+        /// Unknown counts as on, which is the safe choice.
+        /// </summary>
+        private static bool minimiseOnFocusLoss()
+        {
+            try
+            {
+                IntPtr value = SDL_GetHint("SDL_VIDEO_MINIMIZE_ON_FOCUS_LOSS");
+                if (value == IntPtr.Zero)
+                    return true;
+
+                string text = Marshal.PtrToStringUTF8(value);
+                return text != "0" && !string.Equals(text, "false", StringComparison.OrdinalIgnoreCase);
+            }
+            catch (Exception)
+            {
+                return true;
+            }
+        }
+
+        [DllImport("SDL3", CallingConvention = CallingConvention.Cdecl)]
+        private static extern IntPtr SDL_GetHint([MarshalAs(UnmanagedType.LPUTF8Str)] string name);
 
         private static void getRefreshRate(IntPtr hwnd, out int numerator, out int denominator)
         {
@@ -480,7 +678,9 @@ namespace Veldrid.D3D11
                 using (var dxgiFactory = gd.Adapter.GetParent<IDXGIFactory>())
                 {
                     DxgiSwapChain = dxgiFactory.CreateSwapChain(gd.Device, dxgiScDesc);
-                    dxgiFactory.MakeWindowAssociation(win32Source.Hwnd, WindowAssociationFlags.IgnoreAltEnter);
+                    dxgiFactory.MakeWindowAssociation(win32Source.Hwnd, classicExclusive && keepOnOtherMonitor && !minimiseOnFocusLoss()
+                        ? WindowAssociationFlags.IgnoreAltEnter | WindowAssociationFlags.IgnoreAll
+                        : WindowAssociationFlags.IgnoreAltEnter);
                 }
             }
             else if (description.Source is UwpSwapchainSource uwpSource)

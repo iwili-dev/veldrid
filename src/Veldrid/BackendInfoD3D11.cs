@@ -32,6 +32,27 @@ namespace Veldrid
         /// </summary>
         public int DeviceId => gd.DeviceId;
 
+        /// <summary>
+        ///     Whether the main swapchain is currently in DXGI exclusive fullscreen (as set by <see cref="SetExclusiveFullscreen" />).
+        /// </summary>
+        public bool IsExclusiveFullscreen => gd.MainD3D11Swapchain?.IsExclusiveFullscreen ?? false;
+
+        /// <summary>
+        ///     Details about the last <see cref="SetExclusiveFullscreen" /> attempt, for logging.
+        /// </summary>
+        public string LastExclusiveFullscreenInfo => gd.MainD3D11Swapchain?.LastExclusiveInfo ?? string.Empty;
+
+        /// <summary>
+        ///     Switches the main swapchain in or out of DXGI exclusive fullscreen (IDXGISwapChain::SetFullscreenState).
+        ///     Turns off tearing on the swapchain when entering, as the two are mutually exclusive.
+        /// </summary>
+        /// <returns>An HRESULT; negative values indicate failure.</returns>
+        public int SetExclusiveFullscreen(bool fullscreen, int width, int height, int refreshNumerator, int refreshDenominator)
+        {
+            var sc = gd.MainD3D11Swapchain;
+            return sc == null ? unchecked((int)0x80004005) : sc.SetExclusiveFullscreen(fullscreen, width, height, refreshNumerator, refreshDenominator);
+        }
+
         private readonly D3D11GraphicsDevice gd;
 
         internal BackendInfoD3D11(D3D11GraphicsDevice gd)
