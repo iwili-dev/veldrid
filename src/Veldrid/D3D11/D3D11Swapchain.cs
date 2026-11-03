@@ -92,6 +92,13 @@ namespace Veldrid.D3D11
         // Set the environment variable OSU_D3D11_KEEP_ON_OTHER_MONITOR=1 to enable.
         private static readonly bool keepOnOtherMonitor = Environment.GetEnvironmentVariable("OSU_D3D11_KEEP_ON_OTHER_MONITOR") == "1";
 
+        // Experimental, off by default ("Low latency" in the fix program): the classic (exclusive) swapchain has no frame latency waitable object,
+        // so the device-wide DXGI render queue applies: up to 3 frames by default, and every queued frame is input lag
+        // (most noticeable with VSync or when the GPU is the bottleneck).
+        // Set the environment variable OSU_D3D11_FRAME_LATENCY=1 to allow only 1 queued frame while exclusive (2..16 allow more).
+        // Unset or 0 keeps the DXGI default, exactly like the original Veldrid.
+        private static readonly int exclusiveFrameLatency = readFrameLatencySetting();
+
         // Give up after this many failed attempts in a row (a success resets the counter, so many Alt+Tabs over a session do not add up).
         private const int max_automatic_failures = 3;
         private const int retry_delay_ms = 500;
@@ -155,6 +162,9 @@ namespace Veldrid.D3D11
 
         private bool allowTearing;
 
+        // the maximum frame latency this swapchain set on the device (0 = DXGI default).
+        private int appliedFrameLatency;
+
         private uint width;
         private uint height;
 
@@ -206,6 +216,8 @@ namespace Veldrid.D3D11
 
                     IsExclusiveFullscreen = false;
                 }
+
+                applyFrameLatency(false);
 
                 depthTexture?.Dispose();
                 framebuffer.Dispose();
@@ -275,6 +287,7 @@ namespace Veldrid.D3D11
         /// rejects <c>SetFullscreenState</c> on the flip-model swapchain used otherwise. Tearing is not used while exclusive
         /// (exclusive fullscreen can present without vsync on its own).
         /// Leaving through this method also goes back to the flip-model swapchain.
+        /// The refresh rate parameters are not used: the display is already in the wanted mode, and DXGI picks its exact refresh rate.
         /// </summary>
         /// <returns>An HRESULT. Negative values are failures.</returns>
         public int SetExclusiveFullscreen(bool fullscreen, int targetWidth, int targetHeight, int refreshNumerator, int refreshDenominator)
@@ -283,7 +296,7 @@ namespace Veldrid.D3D11
                 return unchecked((int)0x80004005); // E_FAIL
 
             if (fullscreen)
-                return enterExclusive(targetWidth, targetHeight, refreshNumerator, refreshDenominator);
+                return enterExclusive(targetWidth, targetHeight);
 
             int hr = leaveExclusive();
 
@@ -297,7 +310,7 @@ namespace Veldrid.D3D11
             return hr;
         }
 
-        private int enterExclusive(int targetWidth, int targetHeight, int refreshNumerator, int refreshDenominator)
+        private int enterExclusive(int targetWidth, int targetHeight)
         {
             try
             {
@@ -325,7 +338,10 @@ namespace Veldrid.D3D11
 
                 IsExclusiveFullscreen = true;
 
-                var mode = new ModeDescription(targetWidth, targetHeight, new Rational(refreshNumerator, refreshDenominator), colorFormat);
+                // RefreshRate 0/0: DXGI takes the exact refresh rate of the current mode from the output's mode list (e.g. 143.981 Hz, 59.94 Hz).
+                // A rounded value (144 Hz) that is not in that list can make DXGI copy every frame to the front buffer instead of flipping,
+                // or change the display mode once more. Microsoft's "DXGI best practices" recommend exactly this call after SetFullscreenState.
+                var mode = new ModeDescription(targetWidth, targetHeight, new Rational(0, 0), colorFormat);
                 result = DxgiSwapChain.ResizeTarget(mode);
 
                 // DXGI expects ResizeBuffers after every fullscreen transition.
@@ -419,10 +435,8 @@ namespace Veldrid.D3D11
 
                 lastExclusiveAttemptTicks = now;
 
-                getRefreshRate(hwnd, out int numerator, out int denominator);
-
                 var framebufferBefore = framebuffer;
-                int hr = enterExclusive((int)(width * pixelScale), (int)(height * pixelScale), numerator, denominator);
+                int hr = enterExclusive((int)(width * pixelScale), (int)(height * pixelScale));
 
                 bool giveUp = false;
 
@@ -562,50 +576,42 @@ namespace Veldrid.D3D11
         [DllImport("SDL3", CallingConvention = CallingConvention.Cdecl)]
         private static extern IntPtr SDL_GetHint([MarshalAs(UnmanagedType.LPUTF8Str)] string name);
 
-        private static void getRefreshRate(IntPtr hwnd, out int numerator, out int denominator)
+        [DllImport("user32.dll")] private static extern IntPtr GetForegroundWindow();
+        [DllImport("user32.dll")] private static extern bool IsIconic(IntPtr hWnd);
+        [DllImport("user32.dll")] private static extern IntPtr MonitorFromWindow(IntPtr hwnd, uint flags);
+
+        private static int readFrameLatencySetting()
         {
-            numerator = 0;
-            denominator = 0;
+            if (int.TryParse(Environment.GetEnvironmentVariable("OSU_D3D11_FRAME_LATENCY"), out int latency) && latency > 0)
+                return Math.Min(latency, 16);
+
+            // off: keep the DXGI default
+            return 0;
+        }
+
+        /// <summary>
+        /// Limits the render queue while the classic (exclusive) swapchain is used and resets it to the DXGI default otherwise,
+        /// so outside exclusive fullscreen everything behaves like the original Veldrid.
+        /// </summary>
+        private void applyFrameLatency(bool exclusive)
+        {
+            int wanted = exclusive ? exclusiveFrameLatency : 0;
+            if (wanted == appliedFrameLatency)
+                return;
 
             try
             {
-                IntPtr monitor = MonitorFromWindow(hwnd, 2); // MONITOR_DEFAULTTONEAREST
-                var info = new MonitorInfoEx { cbSize = Marshal.SizeOf<MonitorInfoEx>() };
-                if (!GetMonitorInfoW(monitor, ref info)) return;
-
-                byte[] devMode = new byte[220]; // DEVMODEW
-                BitConverter.GetBytes((ushort)220).CopyTo(devMode, 68); // dmSize
-                if (!EnumDisplaySettingsW(info.szDevice, -1, devMode)) return; // ENUM_CURRENT_SETTINGS
-
-                int hz = BitConverter.ToInt32(devMode, 184); // dmDisplayFrequency
-                if (hz > 1)
+                using (var dxgiDevice = gd.Device.QueryInterfaceOrNull<IDXGIDevice1>())
                 {
-                    numerator = hz * 1000;
-                    denominator = 1000;
+                    // 0 resets the device to the DXGI default.
+                    if (dxgiDevice != null && dxgiDevice.SetMaximumFrameLatency(wanted).Success)
+                        appliedFrameLatency = wanted;
                 }
             }
             catch (Exception)
             {
             }
         }
-
-        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
-        private struct MonitorInfoEx
-        {
-            public int cbSize;
-            public int left, top, right, bottom;
-            public int workLeft, workTop, workRight, workBottom;
-            public uint flags;
-
-            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)]
-            public string szDevice;
-        }
-
-        [DllImport("user32.dll")] private static extern IntPtr GetForegroundWindow();
-        [DllImport("user32.dll")] private static extern bool IsIconic(IntPtr hWnd);
-        [DllImport("user32.dll")] private static extern IntPtr MonitorFromWindow(IntPtr hwnd, uint flags);
-        [DllImport("user32.dll", CharSet = CharSet.Unicode)] private static extern bool GetMonitorInfoW(IntPtr hMonitor, ref MonitorInfoEx lpmi);
-        [DllImport("user32.dll", CharSet = CharSet.Unicode)] private static extern bool EnumDisplaySettingsW(string lpszDeviceName, int iModeNum, byte[] lpDevMode);
 
         public void WaitForNextFrameReady()
         {
@@ -732,6 +738,8 @@ namespace Veldrid.D3D11
                     }
                 }
             }
+
+            applyFrameLatency(classicExclusive);
 
             Resize(width, height);
         }
